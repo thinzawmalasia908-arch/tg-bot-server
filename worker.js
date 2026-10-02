@@ -20,10 +20,16 @@ export default {
       // ===== Commands =====
       if (path === '/api/commands' && method === 'GET') return await listCommands(url, env);
       if (path === '/api/commands' && method === 'POST') return await addCommand(request, env);
-
       const cmdUpd = path.match(/^\/api\/commands\/(\d+)$/);
       if (cmdUpd && method === 'PUT') return await updateCommand(cmdUpd[1], request, env);
       if (cmdUpd && method === 'DELETE') return await deleteCommand(cmdUpd[1], request, env);
+
+      // ===== Auto Reply =====
+      if (path === '/api/auto_reply' && method === 'GET') return await listAutoReply(url, env);
+      if (path === '/api/auto_reply' && method === 'POST') return await addAutoReply(request, env);
+      const arUpd = path.match(/^\/api\/auto_reply\/(\d+)$/);
+      if (arUpd && method === 'PUT') return await updateAutoReply(arUpd[1], request, env);
+      if (arUpd && method === 'DELETE') return await deleteAutoReply(arUpd[1], request, env);
 
       // ===== Webhook =====
       const whM = path.match(/^\/webhook\/([^\/]+)$/);
@@ -48,7 +54,6 @@ function cors(body, status = 200) {
   });
 }
 
-// ============ Bot Register ============
 async function registerBot(request, env) {
   const body = await request.json();
   const { token, name, secret } = body;
@@ -56,7 +61,7 @@ async function registerBot(request, env) {
 
   const tgResp = await fetch(`https://api.telegram.org/bot${token}/getMe`);
   const tgJson = await tgResp.json();
-  if (!tgJson.ok) return cors(JSON.stringify({ ok: false, error: 'Token မမှန်: ' + (tgJson.description || '') }), 400);
+  if (!tgJson.ok) return cors(JSON.stringify({ ok: false, error: 'Token မမှန်' }), 400);
 
   const info = tgJson.result;
   const botId = String(info.id);
@@ -65,14 +70,9 @@ async function registerBot(request, env) {
     `INSERT INTO bots (id, token, name, username, owner_secret, enabled, created_at)
      VALUES (?, ?, ?, ?, ?, 0, ?)
      ON CONFLICT(id) DO UPDATE SET
-       token = excluded.token,
-       name = excluded.name,
-       username = excluded.username,
-       owner_secret = excluded.owner_secret`
+       token = excluded.token, name = excluded.name,
+       username = excluded.username, owner_secret = excluded.owner_secret`
   ).bind(botId, token, name || info.first_name, info.username, secret, Date.now()).run();
-
-  const origin = new URL(request.url).origin;
-  const webhookUrl = `${origin}/webhook/${botId}`;
 
   const existing = await env.DB.prepare(`SELECT COUNT(*) as c FROM commands WHERE bot_id = ?`).bind(botId).first();
   if (!existing || existing.c === 0) {
@@ -85,7 +85,7 @@ async function registerBot(request, env) {
   }
 
   return cors(JSON.stringify({
-    ok: true, botId, username: info.username, firstName: info.first_name, webhookUrl,
+    ok: true, botId, username: info.username, firstName: info.first_name,
   }));
 }
 
@@ -93,7 +93,7 @@ async function listBots(url, env) {
   const secret = url.searchParams.get('secret');
   if (!secret) return cors(JSON.stringify({ ok: false, error: 'secret required' }), 400);
   const r = await env.DB.prepare(
-    `SELECT id, name, username, enabled, created_at FROM bots WHERE owner_secret = ?`
+    `SELECT id, name, username, enabled FROM bots WHERE owner_secret = ?`
   ).bind(secret).all();
   return cors(JSON.stringify({ ok: true, bots: r.results || [] }));
 }
@@ -107,8 +107,7 @@ async function toggleBot(botId, request, env) {
 
   const origin = new URL(request.url).origin;
   if (enabled) {
-    const webhookUrl = `${origin}/webhook/${botId}`;
-    await fetch(`https://api.telegram.org/bot${bot.token}/setWebhook?url=${encodeURIComponent(webhookUrl)}`);
+    await fetch(`https://api.telegram.org/bot${bot.token}/setWebhook?url=${encodeURIComponent(origin + '/webhook/' + botId)}`);
   } else {
     await fetch(`https://api.telegram.org/bot${bot.token}/deleteWebhook`);
   }
@@ -130,49 +129,35 @@ async function deleteBot(botId, request, env) {
   return cors(JSON.stringify({ ok: true }));
 }
 
-// ============ COMMANDS CRUD ============
+// ===== Commands CRUD =====
 async function listCommands(url, env) {
   const botId = url.searchParams.get('botId');
   const secret = url.searchParams.get('secret');
   if (!botId || !secret) return cors(JSON.stringify({ ok: false, error: 'botId & secret required' }), 400);
-
   const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
   if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
-
-  const r = await env.DB.prepare(
-    `SELECT id, trigger, response, enabled FROM commands WHERE bot_id = ? ORDER BY id`
-  ).bind(botId).all();
-
+  const r = await env.DB.prepare(`SELECT id, trigger, response, enabled FROM commands WHERE bot_id = ? ORDER BY id`).bind(botId).all();
   return cors(JSON.stringify({ ok: true, commands: r.results || [] }));
 }
 
 async function addCommand(request, env) {
   const body = await request.json();
   const { botId, trigger, response, secret } = body;
-  if (!botId || !trigger || !response || !secret)
-    return cors(JSON.stringify({ ok: false, error: 'All fields required' }), 400);
-
+  if (!botId || !trigger || !response || !secret) return cors(JSON.stringify({ ok: false, error: 'All required' }), 400);
   const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
   if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
-
   let t = trigger.trim();
   if (!t.startsWith('/')) t = '/' + t;
-
-  await env.DB.prepare(
-    `INSERT INTO commands (bot_id, trigger, response, enabled) VALUES (?, ?, ?, 1)`
-  ).bind(botId, t, response).run();
-
+  await env.DB.prepare(`INSERT INTO commands (bot_id, trigger, response, enabled) VALUES (?, ?, ?, 1)`).bind(botId, t, response).run();
   return cors(JSON.stringify({ ok: true }));
 }
 
 async function updateCommand(id, request, env) {
   const body = await request.json();
   const { trigger, response, enabled, secret, botId } = body;
-  if (!secret || !botId) return cors(JSON.stringify({ ok: false, error: 'secret & botId required' }), 400);
-
+  if (!secret || !botId) return cors(JSON.stringify({ ok: false, error: 'required' }), 400);
   const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
   if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
-
   if (trigger !== undefined) {
     let t = trigger.trim();
     if (!t.startsWith('/')) t = '/' + t;
@@ -190,21 +175,62 @@ async function updateCommand(id, request, env) {
 async function deleteCommand(id, request, env) {
   const body = await request.json();
   const { secret, botId } = body;
-  if (!secret || !botId) return cors(JSON.stringify({ ok: false, error: 'secret & botId required' }), 400);
-
+  if (!secret || !botId) return cors(JSON.stringify({ ok: false, error: 'required' }), 400);
   const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
   if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
-
   await env.DB.prepare(`DELETE FROM commands WHERE id = ? AND bot_id = ?`).bind(id, botId).run();
   return cors(JSON.stringify({ ok: true }));
 }
 
-// ============ Webhook ============
+// ===== Auto Reply CRUD =====
+async function listAutoReply(url, env) {
+  const botId = url.searchParams.get('botId');
+  const secret = url.searchParams.get('secret');
+  if (!botId || !secret) return cors(JSON.stringify({ ok: false, error: 'botId & secret required' }), 400);
+  const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
+  if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
+  const r = await env.DB.prepare(`SELECT id, keyword, response, match_type, enabled FROM auto_reply WHERE bot_id = ? ORDER BY id`).bind(botId).all();
+  return cors(JSON.stringify({ ok: true, rules: r.results || [] }));
+}
+
+async function addAutoReply(request, env) {
+  const body = await request.json();
+  const { botId, keyword, response, match_type, secret } = body;
+  if (!botId || !keyword || !response || !secret) return cors(JSON.stringify({ ok: false, error: 'All required' }), 400);
+  const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
+  if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
+  const mt = match_type || 'contains';
+  await env.DB.prepare(`INSERT INTO auto_reply (bot_id, keyword, response, match_type, enabled) VALUES (?, ?, ?, ?, 1)`).bind(botId, keyword, response, mt).run();
+  return cors(JSON.stringify({ ok: true }));
+}
+
+async function updateAutoReply(id, request, env) {
+  const body = await request.json();
+  const { keyword, response, match_type, enabled, secret, botId } = body;
+  if (!secret || !botId) return cors(JSON.stringify({ ok: false, error: 'required' }), 400);
+  const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
+  if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
+  if (keyword !== undefined) await env.DB.prepare(`UPDATE auto_reply SET keyword = ? WHERE id = ? AND bot_id = ?`).bind(keyword, id, botId).run();
+  if (response !== undefined) await env.DB.prepare(`UPDATE auto_reply SET response = ? WHERE id = ? AND bot_id = ?`).bind(response, id, botId).run();
+  if (match_type !== undefined) await env.DB.prepare(`UPDATE auto_reply SET match_type = ? WHERE id = ? AND bot_id = ?`).bind(match_type, id, botId).run();
+  if (enabled !== undefined) await env.DB.prepare(`UPDATE auto_reply SET enabled = ? WHERE id = ? AND bot_id = ?`).bind(enabled ? 1 : 0, id, botId).run();
+  return cors(JSON.stringify({ ok: true }));
+}
+
+async function deleteAutoReply(id, request, env) {
+  const body = await request.json();
+  const { secret, botId } = body;
+  if (!secret || !botId) return cors(JSON.stringify({ ok: false, error: 'required' }), 400);
+  const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
+  if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
+  await env.DB.prepare(`DELETE FROM auto_reply WHERE id = ? AND bot_id = ?`).bind(id, botId).run();
+  return cors(JSON.stringify({ ok: true }));
+}
+
 async function handleWebhook(botId, request, env) {
   const update = await request.json();
   const msg = update.message || update.edited_message;
   if (!msg || !msg.text) return new Response('ok');
-
   const bot = await env.DB.prepare(`SELECT token, enabled FROM bots WHERE id = ?`).bind(botId).first();
   if (!bot || !bot.enabled) return new Response('ok');
 
