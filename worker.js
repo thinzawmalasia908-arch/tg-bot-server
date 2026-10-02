@@ -10,10 +10,8 @@ export default {
       // ===== Bots =====
       if (path === '/api/bots' && method === 'POST') return await registerBot(request, env);
       if (path === '/api/bots' && method === 'GET') return await listBots(url, env);
-
       const toggleM = path.match(/^\/api\/bots\/([^\/]+)\/toggle$/);
       if (toggleM && method === 'POST') return await toggleBot(toggleM[1], request, env);
-
       const delM = path.match(/^\/api\/bots\/([^\/]+)$/);
       if (delM && method === 'DELETE') return await deleteBot(delM[1], request, env);
 
@@ -30,6 +28,13 @@ export default {
       const arUpd = path.match(/^\/api\/auto_reply\/(\d+)$/);
       if (arUpd && method === 'PUT') return await updateAutoReply(arUpd[1], request, env);
       if (arUpd && method === 'DELETE') return await deleteAutoReply(arUpd[1], request, env);
+
+      // ===== Menus =====
+      if (path === '/api/menus' && method === 'GET') return await listMenus(url, env);
+      if (path === '/api/menus' && method === 'POST') return await addMenu(request, env);
+      const menuUpd = path.match(/^\/api\/menus\/(\d+)$/);
+      if (menuUpd && method === 'PUT') return await updateMenu(menuUpd[1], request, env);
+      if (menuUpd && method === 'DELETE') return await deleteMenu(menuUpd[1], request, env);
 
       // ===== Webhook =====
       const whM = path.match(/^\/webhook\/([^\/]+)$/);
@@ -84,6 +89,19 @@ async function registerBot(request, env) {
       .bind(botId, 'hello', 'မင်္ဂလာပါ 👋', 'contains').run();
   }
 
+  // Default menu — ၄ ခလုတ်
+  const menuExist = await env.DB.prepare(`SELECT COUNT(*) as c FROM menus WHERE bot_id = ?`).bind(botId).first();
+  if (!menuExist || menuExist.c === 0) {
+    await env.DB.prepare(`INSERT INTO menus (bot_id, label, action, row_num, enabled) VALUES (?, ?, ?, ?, 1)`)
+      .bind(botId, '📅 Time', '/time', 1).run();
+    await env.DB.prepare(`INSERT INTO menus (bot_id, label, action, row_num, enabled) VALUES (?, ?, ?, ?, 1)`)
+      .bind(botId, 'ℹ️ Help', '/help', 1).run();
+    await env.DB.prepare(`INSERT INTO menus (bot_id, label, action, row_num, enabled) VALUES (?, ?, ?, ?, 1)`)
+      .bind(botId, '👋 Hello', 'hello', 2).run();
+    await env.DB.prepare(`INSERT INTO menus (bot_id, label, action, row_num, enabled) VALUES (?, ?, ?, ?, 1)`)
+      .bind(botId, '🛒 Price', 'ဈေး', 2).run();
+  }
+
   return cors(JSON.stringify({
     ok: true, botId, username: info.username, firstName: info.first_name,
   }));
@@ -92,9 +110,7 @@ async function registerBot(request, env) {
 async function listBots(url, env) {
   const secret = url.searchParams.get('secret');
   if (!secret) return cors(JSON.stringify({ ok: false, error: 'secret required' }), 400);
-  const r = await env.DB.prepare(
-    `SELECT id, name, username, enabled FROM bots WHERE owner_secret = ?`
-  ).bind(secret).all();
+  const r = await env.DB.prepare(`SELECT id, name, username, enabled FROM bots WHERE owner_secret = ?`).bind(secret).all();
   return cors(JSON.stringify({ ok: true, bots: r.results || [] }));
 }
 
@@ -121,19 +137,19 @@ async function deleteBot(botId, request, env) {
   const bot = await env.DB.prepare(`SELECT token, owner_secret FROM bots WHERE id = ?`).bind(botId).first();
   if (!bot) return cors(JSON.stringify({ ok: false, error: 'Not found' }), 404);
   if (bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
-
   await fetch(`https://api.telegram.org/bot${bot.token}/deleteWebhook`);
   await env.DB.prepare(`DELETE FROM bots WHERE id = ?`).bind(botId).run();
   await env.DB.prepare(`DELETE FROM commands WHERE bot_id = ?`).bind(botId).run();
   await env.DB.prepare(`DELETE FROM auto_reply WHERE bot_id = ?`).bind(botId).run();
+  await env.DB.prepare(`DELETE FROM menus WHERE bot_id = ?`).bind(botId).run();
   return cors(JSON.stringify({ ok: true }));
 }
 
-// ===== Commands CRUD =====
+// ===== Commands =====
 async function listCommands(url, env) {
   const botId = url.searchParams.get('botId');
   const secret = url.searchParams.get('secret');
-  if (!botId || !secret) return cors(JSON.stringify({ ok: false, error: 'botId & secret required' }), 400);
+  if (!botId || !secret) return cors(JSON.stringify({ ok: false, error: 'required' }), 400);
   const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
   if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
   const r = await env.DB.prepare(`SELECT id, trigger, response, enabled FROM commands WHERE bot_id = ? ORDER BY id`).bind(botId).all();
@@ -143,7 +159,7 @@ async function listCommands(url, env) {
 async function addCommand(request, env) {
   const body = await request.json();
   const { botId, trigger, response, secret } = body;
-  if (!botId || !trigger || !response || !secret) return cors(JSON.stringify({ ok: false, error: 'All required' }), 400);
+  if (!botId || !trigger || !response || !secret) return cors(JSON.stringify({ ok: false, error: 'required' }), 400);
   const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
   if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
   let t = trigger.trim();
@@ -163,12 +179,8 @@ async function updateCommand(id, request, env) {
     if (!t.startsWith('/')) t = '/' + t;
     await env.DB.prepare(`UPDATE commands SET trigger = ? WHERE id = ? AND bot_id = ?`).bind(t, id, botId).run();
   }
-  if (response !== undefined) {
-    await env.DB.prepare(`UPDATE commands SET response = ? WHERE id = ? AND bot_id = ?`).bind(response, id, botId).run();
-  }
-  if (enabled !== undefined) {
-    await env.DB.prepare(`UPDATE commands SET enabled = ? WHERE id = ? AND bot_id = ?`).bind(enabled ? 1 : 0, id, botId).run();
-  }
+  if (response !== undefined) await env.DB.prepare(`UPDATE commands SET response = ? WHERE id = ? AND bot_id = ?`).bind(response, id, botId).run();
+  if (enabled !== undefined) await env.DB.prepare(`UPDATE commands SET enabled = ? WHERE id = ? AND bot_id = ?`).bind(enabled ? 1 : 0, id, botId).run();
   return cors(JSON.stringify({ ok: true }));
 }
 
@@ -182,11 +194,11 @@ async function deleteCommand(id, request, env) {
   return cors(JSON.stringify({ ok: true }));
 }
 
-// ===== Auto Reply CRUD =====
+// ===== Auto Reply =====
 async function listAutoReply(url, env) {
   const botId = url.searchParams.get('botId');
   const secret = url.searchParams.get('secret');
-  if (!botId || !secret) return cors(JSON.stringify({ ok: false, error: 'botId & secret required' }), 400);
+  if (!botId || !secret) return cors(JSON.stringify({ ok: false, error: 'required' }), 400);
   const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
   if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
   const r = await env.DB.prepare(`SELECT id, keyword, response, match_type, enabled FROM auto_reply WHERE bot_id = ? ORDER BY id`).bind(botId).all();
@@ -196,7 +208,7 @@ async function listAutoReply(url, env) {
 async function addAutoReply(request, env) {
   const body = await request.json();
   const { botId, keyword, response, match_type, secret } = body;
-  if (!botId || !keyword || !response || !secret) return cors(JSON.stringify({ ok: false, error: 'All required' }), 400);
+  if (!botId || !keyword || !response || !secret) return cors(JSON.stringify({ ok: false, error: 'required' }), 400);
   const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
   if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
   const mt = match_type || 'contains';
@@ -227,6 +239,52 @@ async function deleteAutoReply(id, request, env) {
   return cors(JSON.stringify({ ok: true }));
 }
 
+// ===== Menus =====
+async function listMenus(url, env) {
+  const botId = url.searchParams.get('botId');
+  const secret = url.searchParams.get('secret');
+  if (!botId || !secret) return cors(JSON.stringify({ ok: false, error: 'required' }), 400);
+  const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
+  if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
+  const r = await env.DB.prepare(`SELECT id, label, action, row_num, enabled FROM menus WHERE bot_id = ? ORDER BY row_num, id`).bind(botId).all();
+  return cors(JSON.stringify({ ok: true, menus: r.results || [] }));
+}
+
+async function addMenu(request, env) {
+  const body = await request.json();
+  const { botId, label, action, row_num, secret } = body;
+  if (!botId || !label || !action || !secret) return cors(JSON.stringify({ ok: false, error: 'required' }), 400);
+  const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
+  if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
+  const rn = row_num || 1;
+  await env.DB.prepare(`INSERT INTO menus (bot_id, label, action, row_num, enabled) VALUES (?, ?, ?, ?, 1)`).bind(botId, label, action, rn).run();
+  return cors(JSON.stringify({ ok: true }));
+}
+
+async function updateMenu(id, request, env) {
+  const body = await request.json();
+  const { label, action, row_num, enabled, secret, botId } = body;
+  if (!secret || !botId) return cors(JSON.stringify({ ok: false, error: 'required' }), 400);
+  const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
+  if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
+  if (label !== undefined) await env.DB.prepare(`UPDATE menus SET label = ? WHERE id = ? AND bot_id = ?`).bind(label, id, botId).run();
+  if (action !== undefined) await env.DB.prepare(`UPDATE menus SET action = ? WHERE id = ? AND bot_id = ?`).bind(action, id, botId).run();
+  if (row_num !== undefined) await env.DB.prepare(`UPDATE menus SET row_num = ? WHERE id = ? AND bot_id = ?`).bind(row_num, id, botId).run();
+  if (enabled !== undefined) await env.DB.prepare(`UPDATE menus SET enabled = ? WHERE id = ? AND bot_id = ?`).bind(enabled ? 1 : 0, id, botId).run();
+  return cors(JSON.stringify({ ok: true }));
+}
+
+async function deleteMenu(id, request, env) {
+  const body = await request.json();
+  const { secret, botId } = body;
+  if (!secret || !botId) return cors(JSON.stringify({ ok: false, error: 'required' }), 400);
+  const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
+  if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
+  await env.DB.prepare(`DELETE FROM menus WHERE id = ? AND bot_id = ?`).bind(id, botId).run();
+  return cors(JSON.stringify({ ok: true }));
+}
+
+// ===== Webhook =====
 async function handleWebhook(botId, request, env) {
   const update = await request.json();
   const msg = update.message || update.edited_message;
@@ -237,13 +295,23 @@ async function handleWebhook(botId, request, env) {
   const chatId = msg.chat.id;
   const text = msg.text.trim();
   let reply = null;
+  let showMenu = false;
 
-  if (text.startsWith('/')) {
+  // /start or /menu → reply + menu
+  if (text === '/start' || text === '/menu') {
+    const c = await env.DB.prepare(`SELECT response FROM commands WHERE bot_id = ? AND trigger = ? AND enabled = 1`).bind(botId, text).first();
+    reply = c ? c.response : 'မင်္ဂလာပါ!';
+    showMenu = true;
+  }
+
+  // Other commands
+  if (!reply && text.startsWith('/')) {
     const c = await env.DB.prepare(`SELECT trigger, response FROM commands WHERE bot_id = ? AND enabled = 1`).bind(botId).all();
     const hit = (c.results || []).find(x => text === x.trigger || text.startsWith(x.trigger + ' '));
     if (hit) reply = hit.response;
   }
 
+  // Auto-reply
   if (!reply) {
     const r = await env.DB.prepare(`SELECT keyword, response, match_type FROM auto_reply WHERE bot_id = ? AND enabled = 1`).bind(botId).all();
     const t = text.toLowerCase();
@@ -257,11 +325,29 @@ async function handleWebhook(botId, request, env) {
     }
   }
 
+  // Send reply
   if (reply) {
+    const payload = { chat_id: chatId, text: reply };
+    if (showMenu) {
+      const menus = await env.DB.prepare(`SELECT label, action, row_num FROM menus WHERE bot_id = ? AND enabled = 1 ORDER BY row_num, id`).bind(botId).all();
+      const rows = {};
+      for (const m of (menus.results || [])) {
+        if (!rows[m.row_num]) rows[m.row_num] = [];
+        rows[m.row_num].push({ text: m.label });
+      }
+      const keyboard = Object.keys(rows).sort((a,b) => a-b).map(rn => rows[rn]);
+      if (keyboard.length > 0) {
+        payload.reply_markup = {
+          keyboard: keyboard,
+          resize_keyboard: true,
+          is_persistent: true,
+        };
+      }
+    }
     await fetch(`https://api.telegram.org/bot${bot.token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: reply }),
+      body: JSON.stringify(payload),
     });
   }
   return new Response('ok');
