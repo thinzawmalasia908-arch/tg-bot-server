@@ -36,9 +36,13 @@ export default {
       if (mnUpd && method === 'PUT') return await updateMenu(mnUpd[1], request, env);
       if (mnUpd && method === 'DELETE') return await deleteMenu(mnUpd[1], request, env);
 
+      // ===== Logs ⭐ =====
+      if (path === '/api/logs' && method === 'GET') return await listLogs(url, env);
+      if (path === '/api/logs/clear' && method === 'POST') return await clearLogs(request, env);
+
       // ===== Webhook =====
       const whM = path.match(/^\/webhook\/([^\/]+)$/);
-      if (whM && method === 'POST') return await handleWebhook(whM[1], request, env);
+      if (whM && method === 'POST') return await handleWebhook(whM[1], request, env, ctx);
 
       return cors(JSON.stringify({ error: 'Not found', path }), 404);
     } catch (e) {
@@ -59,7 +63,17 @@ function cors(body, status = 200) {
   });
 }
 
-// ===== Register Bot — Default commands မထည့် ⭐ =====
+// ===== Logs Helper ⭐ =====
+async function writeLog(env, botId, type, userName, userId, message, reply, status = 'ok') {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO logs (bot_id, type, user_name, user_id, message, reply, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(botId, type, userName || '', userId || '', message || '', reply || '', status, Date.now()).run();
+  } catch (_) {}
+}
+
+// ===== Register Bot =====
 async function registerBot(request, env) {
   const body = await request.json();
   const { token, name, secret } = body;
@@ -79,9 +93,6 @@ async function registerBot(request, env) {
        username=excluded.username, owner_secret=excluded.owner_secret`
   ).bind(botId, token, name || info.first_name, info.username, secret, Date.now()).run();
 
-  // ⭐ Default commands insert code ဖျက်ပြီး — ဘာမှ auto မထည့်
-  // User ကိုယ်တိုင် သတ်မှတ်မယ်
-
   return cors(JSON.stringify({
     ok: true, botId, username: info.username, firstName: info.first_name,
   }));
@@ -94,7 +105,6 @@ async function listBots(url, env) {
   return cors(JSON.stringify({ ok: true, bots: r.results || [] }));
 }
 
-// ===== Toggle Bot — Switch ON ရင် /start auto-add ⭐ =====
 async function toggleBot(botId, request, env) {
   const body = await request.json();
   const { enabled, secret } = body;
@@ -106,23 +116,21 @@ async function toggleBot(botId, request, env) {
   const origin = new URL(request.url).origin;
 
   if (enabled) {
-    // ⭐ Switch ON ရင် — /start ရှိလား စစ်
     const hasStart = await env.DB.prepare(
       `SELECT COUNT(*) as c FROM commands WHERE bot_id = ? AND trigger = '/start'`
     ).bind(botId).first();
 
     if (!hasStart || hasStart.c === 0) {
-      // မရှိရင် auto ထည့်
       await env.DB.prepare(
         `INSERT INTO commands (bot_id, trigger, response, enabled) VALUES (?, ?, ?, 1)`
       ).bind(botId, '/start', 'မင်္ဂလာပါ! ကျွန်တော် bot ဖြစ်ပါတယ် 🤖').run();
     }
 
-    // Webhook register
     await fetch(`https://api.telegram.org/bot${bot.token}/setWebhook?url=${encodeURIComponent(origin + '/webhook/' + botId)}`);
+    await writeLog(env, botId, 'toggle', 'system', '', 'Bot enabled', 'Webhook registered');
   } else {
-    // Switch OFF — Webhook delete
     await fetch(`https://api.telegram.org/bot${bot.token}/deleteWebhook`);
+    await writeLog(env, botId, 'toggle', 'system', '', 'Bot disabled', 'Webhook removed');
   }
 
   await env.DB.prepare(`UPDATE bots SET enabled = ? WHERE id = ?`).bind(enabled ? 1 : 0, botId).run();
@@ -141,6 +149,7 @@ async function deleteBot(botId, request, env) {
   await env.DB.prepare(`DELETE FROM commands WHERE bot_id = ?`).bind(botId).run();
   await env.DB.prepare(`DELETE FROM auto_reply WHERE bot_id = ?`).bind(botId).run();
   await env.DB.prepare(`DELETE FROM menus WHERE bot_id = ?`).bind(botId).run();
+  await env.DB.prepare(`DELETE FROM logs WHERE bot_id = ?`).bind(botId).run();
   return cors(JSON.stringify({ ok: true }));
 }
 
@@ -282,8 +291,63 @@ async function deleteMenu(id, request, env) {
   return cors(JSON.stringify({ ok: true }));
 }
 
-// ===== Webhook Handler =====
-async function handleWebhook(botId, request, env) {
+// ===== Logs API ⭐ =====
+async function listLogs(url, env) {
+  const botId = url.searchParams.get('botId');
+  const secret = url.searchParams.get('secret');
+  const filter = url.searchParams.get('filter') || 'today';
+  const limit = parseInt(url.searchParams.get('limit') || '100');
+
+  if (!botId || !secret) return cors(JSON.stringify({ ok: false, error: 'required' }), 400);
+  const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
+  if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
+
+  let where = 'bot_id = ?';
+  const params = [botId];
+
+  if (filter === 'today') {
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    where += ' AND created_at >= ?';
+    params.push(todayStart.getTime());
+  } else if (filter === 'week') {
+    const weekAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+    where += ' AND created_at >= ?';
+    params.push(weekAgo);
+  } else if (filter === 'errors') {
+    where += ` AND status = 'error'`;
+  }
+
+  const sql = `SELECT id, type, user_name, user_id, message, reply, status, created_at 
+               FROM logs WHERE ${where} ORDER BY created_at DESC LIMIT ?`;
+  params.push(limit);
+
+  const stmt = env.DB.prepare(sql);
+  const r = await stmt.bind(...params).all();
+
+  return cors(JSON.stringify({ ok: true, logs: r.results || [] }));
+}
+
+async function clearLogs(request, env) {
+  const body = await request.json();
+  const { botId, secret, filter } = body;
+  if (!botId || !secret) return cors(JSON.stringify({ ok: false, error: 'required' }), 400);
+
+  const bot = await env.DB.prepare(`SELECT owner_secret FROM bots WHERE id = ?`).bind(botId).first();
+  if (!bot || bot.owner_secret !== secret) return cors(JSON.stringify({ ok: false, error: 'Unauthorized' }), 403);
+
+  if (filter === 'all') {
+    await env.DB.prepare(`DELETE FROM logs WHERE bot_id = ?`).bind(botId).run();
+  } else {
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    await env.DB.prepare(`DELETE FROM logs WHERE bot_id = ? AND created_at >= ?`).bind(botId, todayStart.getTime()).run();
+  }
+  return cors(JSON.stringify({ ok: true }));
+}
+
+// ===== Webhook — Auto Log ⭐ =====
+async function handleWebhook(botId, request, env, ctx) {
   const update = await request.json();
   const msg = update.message || update.edited_message;
   if (!msg || !msg.text) return new Response('ok');
@@ -293,26 +357,35 @@ async function handleWebhook(botId, request, env) {
 
   const chatId = msg.chat.id;
   const text = msg.text.trim();
+  const userName = msg.from?.first_name || msg.from?.username || 'Unknown';
+  const userId = String(msg.from?.id || '');
   let reply = null;
+  let logType = 'msg';
 
-  // 1. Commands — /xyz
+  // 1. Commands
   if (text.startsWith('/')) {
     const c = await env.DB.prepare(`SELECT trigger, response FROM commands WHERE bot_id = ? AND enabled = 1`).bind(botId).all();
     const hit = (c.results || []).find(x => text === x.trigger || text.startsWith(x.trigger + ' '));
-    if (hit) reply = hit.response;
+    if (hit) {
+      reply = hit.response;
+      logType = 'cmd';
+    }
   }
 
-  // 2. Menu buttons — label နှိပ်ရင် action command ရှာ
+  // 2. Menu buttons
   if (!reply) {
     const mn = await env.DB.prepare(`SELECT label, action FROM menus WHERE bot_id = ? AND enabled = 1`).bind(botId).all();
     const menuHit = (mn.results || []).find(x => x.label === text);
     if (menuHit) {
       const cmd = await env.DB.prepare(`SELECT response FROM commands WHERE bot_id = ? AND trigger = ? AND enabled = 1`).bind(botId, menuHit.action).first();
-      if (cmd) reply = cmd.response;
+      if (cmd) {
+        reply = cmd.response;
+        logType = 'menu';
+      }
     }
   }
 
-  // 3. Auto-Reply — keyword
+  // 3. Auto-Reply
   if (!reply) {
     const r = await env.DB.prepare(`SELECT keyword, response, match_type FROM auto_reply WHERE bot_id = ? AND enabled = 1`).bind(botId).all();
     const t = text.toLowerCase();
@@ -322,11 +395,15 @@ async function handleWebhook(botId, request, env) {
       if (row.match_type === 'exact') ok = t === k;
       else if (row.match_type === 'starts') ok = t.startsWith(k);
       else ok = t.includes(k);
-      if (ok) { reply = row.response; break; }
+      if (ok) {
+        reply = row.response;
+        logType = 'auto';
+        break;
+      }
     }
   }
 
-  // 4. /start သို့ /menu ဆိုရင် menu keyboard ပါ ပို့
+  // 4. Menu keyboard for /start, /menu
   let replyMarkup = null;
   if (text === '/start' || text === '/menu') {
     const mn = await env.DB.prepare(`SELECT label, action, row_num FROM menus WHERE bot_id = ? AND enabled = 1 ORDER BY row_num, id`).bind(botId).all();
@@ -342,14 +419,25 @@ async function handleWebhook(botId, request, env) {
     }
   }
 
+  // 5. Send reply
   if (reply || replyMarkup) {
     const payload = { chat_id: chatId, text: reply || 'မီနူး 👇' };
     if (replyMarkup) payload.reply_markup = replyMarkup;
-    await fetch(`https://api.telegram.org/bot${bot.token}/sendMessage`, {
+
+    const sendRes = await fetch(`https://api.telegram.org/bot${bot.token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
+
+    if (sendRes.ok) {
+      await writeLog(env, botId, logType, userName, userId, text, reply || '[Menu]', 'ok');
+    } else {
+      await writeLog(env, botId, 'error', userName, userId, text, '', 'error');
+    }
+  } else {
+    await writeLog(env, botId, 'msg', userName, userId, text, '[no reply]', 'ok');
   }
+
   return new Response('ok');
 }
